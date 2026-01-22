@@ -1,0 +1,14 @@
+# Python cache
+__pycache__/
+*.pyc
+
+# Environment & Instance
+venv/
+env/
+instance/
+.env
+
+# Database & Logs
+*.db
+*.sqlite3
+*.log

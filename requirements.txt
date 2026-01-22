@@ -1,0 +1,9 @@
+Flask
+Flask-SQLAlchemy
+Flask-Login
+opencv-python
+ultralytics
+PyYAML
+requests
+pymodbus
+pyserial

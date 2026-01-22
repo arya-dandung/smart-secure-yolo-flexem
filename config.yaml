@@ -1,0 +1,27 @@
+api_key: rahasia123
+cameras:
+  '1': '0'
+  '2': ''
+  '3': ''
+  '4': ''
+chat_id: 62895359474947@c.us
+confidence: 0.85
+cooldown: 30
+modbus_baud: 9600
+modbus_com: COM1
+modbus_enabled: true
+modbus_ip: 192.168.1.2
+modbus_port: 502
+modbus_slave: 1
+modbus_type: tcp
+plc_coils:
+  '1': 0
+  '2': 1
+  '3': 2
+  '4': 3
+session: default
+telegram_chat_id: '-5191012571'
+telegram_enabled: false
+telegram_token: 8277840015:AAGpvC3GuhTLFBDVg4MfCnXIKwEg8Z1-2l0
+waha_enabled: false
+waha_url: http://localhost:3001/api/sendImage

@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="row justify-content-center" style="margin-top: 10vh;">
+    <div class="col-md-4">
+        <div class="card card-custom p-4">
+            <h4 class="text-center fw-bold mb-4">Login System</h4>
+            <form method="POST">
+                <div class="mb-3">
+                    <label>Username</label>
+                    <input type="text" name="username" class="form-control" required>
+                </div>
+                <div class="mb-3">
+                    <label>Password</label>
+                    <input type="password" name="password" class="form-control" required>
+                </div>
+                <button type="submit" class="btn btn-dark w-100 rounded-pill">Masuk</button>
+            </form>
+            <div class="text-center mt-3 small">
+                <a href="/register">Buat Akun Baru</a>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}

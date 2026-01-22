@@ -1,0 +1,134 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="row g-4">
+    <div class="col-lg-8">
+        <div class="card card-custom h-100 border-0">
+            <div class="card-header bg-white py-3 d-flex justify-content-between">
+                <h5 class="m-0 fw-bold"><i class="bi bi-grid me-2 text-primary"></i>Live Monitor</h5>
+                <span class="badge bg-danger blink-bg px-3 pt-2">LIVE AI</span>
+            </div>
+            <div class="card-body bg-dark p-2">
+                <div class="row g-2">
+                    {% for i in ['1', '2', '3', '4'] %}
+                    <div class="col-md-6">
+                        <div class="position-relative bg-black rounded overflow-hidden" style="aspect-ratio: 16/9;">
+                            {% if config.cameras[i] %}
+                                <img src="{{ url_for('main.video_feed', cam_id=i) }}" class="w-100 h-100" style="object-fit: cover;">
+                                <div class="position-absolute top-0 start-0 p-2"><span class="badge bg-success bg-opacity-75">CAM {{ i }}</span></div>
+                            {% else %}
+                                <div class="d-flex align-items-center justify-content-center h-100 text-secondary flex-column">
+                                    <i class="bi bi-camera-video-off fs-1"></i><small>No Signal</small>
+                                </div>
+                            {% endif %}
+                        </div>
+                    </div>
+                    {% endfor %}
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="col-lg-4">
+        <div class="card card-custom h-100">
+            <div class="card-header bg-white py-3"><h5 class="m-0 fw-bold">Settings</h5></div>
+            <div class="card-body overflow-auto" style="max-height: 80vh;">
+                <form method="POST">
+                    <ul class="nav nav-pills mb-3 nav-justified" role="tablist">
+                        <li class="nav-item"><button class="nav-link active small fw-bold" data-bs-toggle="pill" data-bs-target="#tab-cam" type="button">Cams</button></li>
+                        <li class="nav-item"><button class="nav-link small fw-bold" data-bs-toggle="pill" data-bs-target="#tab-plc" type="button">PLC</button></li>
+                        <li class="nav-item"><button class="nav-link small fw-bold" data-bs-toggle="pill" data-bs-target="#tab-notif" type="button">Notif</button></li>
+                    </ul>
+
+                    <div class="tab-content">
+                        <div class="tab-pane fade show active" id="tab-cam">
+                            {% for i in ['1', '2', '3', '4'] %}
+                            <div class="mb-2">
+                                <label class="small fw-bold">Cam {{ i }} Source</label>
+                                <input type="text" name="cam_{{ i }}" class="form-control form-control-sm" value="{{ config.cameras[i] }}" placeholder="0 or rtsp://...">
+                            </div>
+                            {% endfor %}
+                        </div>
+
+                        <div class="tab-pane fade" id="tab-plc">
+                            <div class="form-check form-switch mb-3">
+                                <input class="form-check-input" type="checkbox" name="modbus_enabled" id="mbSwitch" {% if config.modbus_enabled %}checked{% endif %}>
+                                <label class="form-check-label fw-bold" for="mbSwitch">Enable PLC</label>
+                            </div>
+                            <select class="form-select form-select-sm mb-2" name="modbus_type" id="mbType" onchange="togglePLC()">
+                                <option value="tcp" {% if config.modbus_type == 'tcp' %}selected{% endif %}>TCP (LAN)</option>
+                                <option value="rtu" {% if config.modbus_type == 'rtu' %}selected{% endif %}>RTU (Serial)</option>
+                            </select>
+                            
+                            <div id="tcpSet" class="row g-1 mb-2">
+                                <div class="col-8"><input type="text" name="modbus_ip" class="form-control form-control-sm" value="{{ config.modbus_ip }}" placeholder="IP"></div>
+                                <div class="col-4"><input type="number" name="modbus_port" class="form-control form-control-sm" value="{{ config.modbus_port }}" placeholder="Port"></div>
+                            </div>
+                            <div id="rtuSet" class="row g-1 mb-2" style="display:none">
+                                <div class="col-8"><input type="text" name="modbus_com" class="form-control form-control-sm" value="{{ config.modbus_com }}" placeholder="COM1"></div>
+                                <div class="col-4">
+                                    <select name="modbus_baud" class="form-select form-select-sm">
+                                        <option value="9600" {% if config.modbus_baud == 9600 %}selected{% endif %}>9600</option>
+                                        <option value="115200" {% if config.modbus_baud == 115200 %}selected{% endif %}>115200</option>
+                                    </select>
+                                </div>
+                            </div>
+                            <div class="mb-3"><label class="small">Slave ID</label><input type="number" name="modbus_slave" class="form-control form-control-sm" value="{{ config.modbus_slave }}"></div>
+                            
+                            <hr class="my-2">
+                            <label class="small fw-bold text-primary">Coil Mapping</label>
+                            <div class="p-2 border rounded bg-light">
+                                {% for i in ['1', '2', '3', '4'] %}
+                                <div class="d-flex justify-content-between mb-1">
+                                    <span class="small">Cam {{ i }}</span>
+                                    <input type="number" name="coil_{{ i }}" class="form-control form-control-sm" style="width:70px" value="{{ config.plc_coils[i] }}">
+                                </div>
+                                {% endfor %}
+                            </div>
+                        </div>
+
+                        <div class="tab-pane fade" id="tab-notif">
+                            <div class="row g-2 mb-3">
+                                <div class="col-6"><input type="number" step="0.1" name="confidence" class="form-control form-control-sm" value="{{ config.confidence }}" placeholder="Conf"></div>
+                                <div class="col-6"><input type="number" name="cooldown" class="form-control form-control-sm" value="{{ config.cooldown }}" placeholder="Cool (s)"></div>
+                            </div>
+                            
+                            <div class="card bg-light border-0 p-2 mb-2">
+                                <div class="form-check form-switch mb-1">
+                                    <input class="form-check-input" type="checkbox" name="waha_enabled" {% if config.waha_enabled %}checked{% endif %}>
+                                    <label class="form-check-label fw-bold small">WhatsApp</label>
+                                </div>
+                                <input type="text" name="waha_url" class="form-control form-control-sm mb-1" value="{{ config.waha_url }}" placeholder="API URL">
+                                <input type="password" name="api_key" class="form-control form-control-sm mb-1" value="{{ config.api_key }}" placeholder="API Key">
+                                <input type="text" name="session" class="form-control form-control-sm mb-1" value="{{ config.session }}" placeholder="Session">
+                                <input type="text" name="chat_id" class="form-control form-control-sm" value="{{ config.chat_id }}" placeholder="Chat ID">
+                            </div>
+
+                            <div class="card bg-light border-0 p-2">
+                                <div class="form-check form-switch mb-1">
+                                    <input class="form-check-input" type="checkbox" name="telegram_enabled" {% if config.telegram_enabled %}checked{% endif %}>
+                                    <label class="form-check-label fw-bold small">Telegram</label>
+                                </div>
+                                <input type="password" name="telegram_token" class="form-control form-control-sm mb-1" value="{{ config.telegram_token }}" placeholder="Bot Token">
+                                <input type="text" name="telegram_chat_id" class="form-control form-control-sm" value="{{ config.telegram_chat_id }}" placeholder="Chat ID">
+                            </div>
+                        </div>
+                    </div>
+
+                    <hr>
+                    <button type="submit" class="btn btn-primary w-100 rounded-pill fw-bold">SAVE & RESTART</button>
+                </form>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+    function togglePLC() {
+        const type = document.getElementById('mbType').value;
+        document.getElementById('tcpSet').style.display = (type === 'tcp') ? 'flex' : 'none';
+        document.getElementById('rtuSet').style.display = (type === 'rtu') ? 'flex' : 'none';
+    }
+    document.addEventListener("DOMContentLoaded", togglePLC);
+</script>
+<style>.blink-bg{animation:pulse 2s infinite}@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.5}}</style>
+{% endblock %}

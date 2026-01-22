@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SCADA Cam {{ cam_id }}</title>
+    <style>
+        /* Hilangkan margin/padding bawaan browser */
+        body, html {
+            margin: 0;
+            padding: 0;
+            width: 100%;
+            height: 100%;
+            overflow: hidden; /* Mencegah scrollbar muncul */
+            background-color: #000; /* Latar belakang hitam */
+        }
+
+        /* Atur gambar agar memenuhi container */
+        img {
+            display: block;
+            width: 100%;
+            height: 100%;
+            
+            /* KUNCI AGAR FULL FIT: */
+            object-fit: fill; 
+            
+            /* OPSI LAIN:
+               object-fit: fill;  -> Gambar dipaksa melar penuh (mungkin agak gepeng)
+               object-fit: cover; -> Gambar penuh proporsional (sisi kiri/kanan terpotong)
+               object-fit: contain; -> Gambar utuh (ada bar hitam jika rasio beda)
+            */
+        }
+    </style>
+</head>
+<body>
+    <img src="{{ url_for('scada.stream_feed', cam_id=cam_id) }}" alt="Camera Feed">
+</body>
+</html>
