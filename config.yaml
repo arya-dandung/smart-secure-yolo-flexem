@@ -1,11 +1,11 @@
 api_key: rahasia123
 cameras:
-  '1': '0'
-  '2': ''
-  '3': ''
+  '1': rtsp://admin:STSP2026$@192.168.1.15:554/Streaming/Channels/102
+  '2': '0'
+  '3': rtsp://admin:STSP2026$@192.168.1.10:554/Streaming/Channels/102
   '4': ''
 chat_id: 62895359474947@c.us
-confidence: 0.85
+confidence: 0.55
 cooldown: 30
 modbus_baud: 9600
 modbus_com: COM1
