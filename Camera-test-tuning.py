@@ -1,62 +1,63 @@
+ 
 import os
-# [PENTING] Paksa FFmpeg menggunakan TCP untuk RTSP agar gambar tidak rusak/abu-abu
+# Paksa FFmpeg TCP agar RTSP stabil
 os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
 
 import cv2
 import time
 import threading
 import base64
-import queue
 import numpy as np
-import face_recognition
-from ultralytics import YOLO
+import app.core.globals as g
 
-# Import modul internal
+# Import InsightFace
+from insightface.app import FaceAnalysis
+
+# Import modul internal project Anda
 from .globals import CURRENT_CONFIG, ACTIVE_STREAMS
 from .plc import update_plc_status
 from .notifier import send_whatsapp, send_telegram
-import app.core.globals as g
 
 # ==========================================
-# KONFIGURASI GLOBAL & MODEL
+# 1. KONFIGURASI GLOBAL & MODEL (INSIGHTFACE)
 # ==========================================
-# Gunakan 'yolov8n.pt' untuk kecepatan maksimal. 
-# Jika PC kuat (ada GPU), ganti ke 'yolov8s.pt' untuk akurasi lebih tinggi.
-model = YOLO("yolov8n.pt") 
+print("🚀 Menginisialisasi InsightFace pada GPU...")
+
+# 'buffalo_l' adalah model paling akurat & cepat dari InsightFace
+# providers=['CUDAExecutionProvider'] MEMAKSA pakai NVIDIA GPU
+app_face = FaceAnalysis(name='buffalo_l', providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
+
+# det_size=(640, 640): Resolusi deteksi.
+# Jika wajah kecil tidak terdeteksi, ubah jadi (320, 320) atau (1280, 1280)
+app_face.prepare(ctx_id=0, det_size=(640, 640))
 
 FOLDER_DATABASE = "database_wajah" 
-known_face_encodings = []
-known_face_names = []
+known_embeddings = [] # Pengganti 'encodings'
+known_names = []
 
-# --- TUNING PARAMETER (RAHASIA PERFORMA) ---
-YOLO_CONFIDENCE = 0.35      # 35% yakin sudah dianggap orang (biar sensitif)
-FACE_REC_TOLERANCE = 0.54   # Makin kecil makin ketat. 0.54 adalah sweet spot.
-RECHECK_INTERVAL = 15       # Cek wajah ulang setiap 15 frame (0.5 detik) biar gak berat
+# Threshold Kemiripan (0.0 - 1.0)
+# Di InsightFace, 0.4 sampai 0.6 adalah angka ideal.
+# Semakin TINGGI = Semakin KETAT.
+SIMILARITY_THRESHOLD = 0.50 
 
 # ==========================================
-# HELPER FUNCTIONS
+# 2. LOAD DATABASE WAJAH
 # ==========================================
-def sanitize_image_for_dlib(img_cv):
-    if img_cv is None: return None
-    # Pastikan format contiguous array (Wajib buat Windows biar gak crash)
-    return np.ascontiguousarray(img_cv[:, :, ::-1]) # BGR to RGB shortcut
-
 def load_face_database():
-    global known_face_encodings, known_face_names
+    global known_embeddings, known_names
     
-    # Path absolut agar tidak error saat dijalankan dari Flask
-    base_dir = os.path.dirname(os.path.abspath(__file__)) # Folder app/
-    root_dir = os.path.dirname(base_dir) # Folder project root
+    base_dir = os.path.dirname(os.path.abspath(__file__)) 
+    root_dir = os.path.dirname(base_dir) 
     db_path = os.path.join(root_dir, FOLDER_DATABASE)
 
     if not os.path.exists(db_path):
         os.makedirs(db_path)
-        print(f"📂 [INFO] Folder '{db_path}' dibuat.")
+        print(f"📂 [INFO] Folder database dibuat di: {db_path}")
         return
 
-    print(f"📂 Memuat Database Wajah dari '{db_path}'...")
-    known_face_encodings = [] # Reset dulu
-    known_face_names = []
+    print(f"📂 Memuat Database InsightFace dari '{db_path}'...")
+    known_embeddings = []
+    known_names = []
     
     count = 0
     for filename in os.listdir(db_path):
@@ -64,36 +65,44 @@ def load_face_database():
             path = os.path.join(db_path, filename)
             try:
                 img = cv2.imread(path)
-                rgb = sanitize_image_for_dlib(img)
-                
-                if rgb is not None:
-                    encs = face_recognition.face_encodings(rgb)
-                    if encs:
-                        name = os.path.splitext(filename)[0].replace("_", " ").upper()
-                        name = ''.join([i for i in name if not i.isdigit()]).strip()
-                        known_face_encodings.append(encs[0])
-                        known_face_names.append(name)
-                        count += 1
-            except Exception as e:
-                print(f"   ❌ Gagal: {filename} ({e})")
-                
-    print(f"✨ Total Database: {count} wajah.")
+                if img is None: continue
 
-# Load saat start
+                # Deteksi wajah di foto database
+                faces = app_face.get(img)
+                
+                if len(faces) > 0:
+                    # Ambil wajah terbesar (biasanya index 0 sorted by size)
+                    # Simpan 'embedding' (kode unik wajah)
+                    known_embeddings.append(faces[0].embedding)
+                    
+                    # Bersihkan nama file
+                    name = os.path.splitext(filename)[0].replace("_", " ").upper()
+                    name = ''.join([i for i in name if not i.isdigit()]).strip()
+                    known_names.append(name)
+                    
+                    count += 1
+                    print(f"   ✅ OK: {name}")
+                else:
+                    print(f"   ⚠️ Wajah tidak ditemukan di file: {filename}")
+
+            except Exception as e:
+                print(f"   ❌ Error {filename}: {e}")
+                
+    print(f"✨ Total Database: {count} wajah siap.")
+
 load_face_database()
 
 # ==========================================
-# CLASS 1: BUFFERLESS VIDEO CAPTURE (ANTI LAG)
+# 3. BUFFERLESS CAPTURE (Tetap Sama)
 # ==========================================
 class BufferlessVideoCapture:
     def __init__(self, name):
         self.cap = cv2.VideoCapture(name)
-        # Setting Buffer Size kecil untuk RTSP
-        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1) # Anti Lag
         
         if isinstance(name, int):
-            self.cap.set(3, 640) # Width
-            self.cap.set(4, 480) # Height
+            self.cap.set(3, 640)
+            self.cap.set(4, 480)
             
         self.lock = threading.Lock()
         self.t = threading.Thread(target=self._reader)
@@ -107,21 +116,16 @@ class BufferlessVideoCapture:
         while self.running:
             ret, frame = self.cap.read()
             if not ret:
-                with self.lock:
-                    self.status = False
-                time.sleep(0.5) # Tunggu sebentar jika putus
+                with self.lock: self.status = False
+                time.sleep(0.5)
                 continue
-            
-            # KUNCI ANTI LAG: Selalu timpa frame lama dengan yang baru
             with self.lock:
                 self.latest_frame = frame
                 self.status = True
 
     def read(self):
         with self.lock:
-            if self.latest_frame is not None:
-                return self.status, self.latest_frame.copy()
-            return self.status, None
+            return self.status, (self.latest_frame.copy() if self.latest_frame is not None else None)
 
     def release(self):
         self.running = False
@@ -129,7 +133,7 @@ class BufferlessVideoCapture:
         self.cap.release()
 
 # ==========================================
-# CLASS 2: HYBRID CAM STREAM
+# 4. STREAM PROCESSOR (MODERN ENGINE)
 # ==========================================
 class CamStream(threading.Thread):
     def __init__(self, cam_id, source):
@@ -139,25 +143,22 @@ class CamStream(threading.Thread):
         self.running = True
         self.output_frame = None
         
-        self.detected_ids = set() 
+        # Logika Notifikasi
+        self.detected_names_buffer = set() 
         self.last_detection_time = 0
         self.local_lock = threading.Lock()
         self.cap = None 
 
-        # Cache Identitas: { track_id: "NAMA" }
-        self.identity_cache = {}
-        self.frame_count = 0
-
     def run(self):
-        print(f"🎥 Start Cam {self.cam_id}...")
+        print(f"🎥 Start Cam {self.cam_id} (InsightFace Engine)...")
         self.cap = BufferlessVideoCapture(self.source)
         time.sleep(1) 
 
         while self.running:
             success, frame = self.cap.read()
             
-            # Reconnect Logic
             if not success or frame is None:
+                # Reconnect logic
                 print(f"⚠️ Cam {self.cam_id} Reconnecting...")
                 time.sleep(2)
                 self.cap.release()
@@ -166,158 +167,131 @@ class CamStream(threading.Thread):
                 continue
             
             try:
-                # 1. YOLO TRACKING (Engine Utama)
-                # conf=YOLO_CONFIDENCE (0.35) agar lebih peka
-                results = model.track(frame, persist=True, classes=[0], conf=YOLO_CONFIDENCE, verbose=False)
+                # --- PROSES AI (INSIGHTFACE) ---
+                # app_face.get(frame) melakukan 2 hal sekaligus:
+                # 1. Deteksi lokasi wajah (Face Detection)
+                # 2. Ekstrak kode wajah (Face Embedding)
+                # Ini berjalan di GPU, jadi sangat cepat.
+                faces = app_face.get(frame)
                 
-                boxes = []
-                track_ids = []
-                
-                if results[0].boxes.id is not None:
-                    boxes = results[0].boxes.xyxy.cpu().numpy().astype(int)
-                    track_ids = results[0].boxes.id.cpu().numpy().astype(int)
-                
-                has_person = len(boxes) > 0
+                has_person = len(faces) > 0
                 update_plc_status(self.cam_id, has_person)
 
                 annotated_frame = frame.copy()
+                current_names_in_frame = []
 
                 if has_person:
-                    for box, track_id in zip(boxes, track_ids):
-                        x1, y1, x2, y2 = box
+                    for face in faces:
+                        # Ambil koordinat kotak (BBox)
+                        # InsightFace mengembalikan float, harus jadi int
+                        box = face.bbox.astype(int)
+                        x1, y1, x2, y2 = box[0], box[1], box[2], box[3]
+
+                        # Ambil Embedding Wajah Ini
+                        live_emb = face.embedding
                         
-                        # --- LOGIKA PENGENALAN WAJAH (OPTIMAL) ---
-                        # Cek wajah HANYA jika:
-                        # 1. ID ini belum dikenal (cache kosong)
-                        # 2. ATAU Sudah waktunya re-check (setiap 15 frame)
-                        should_recognize = (track_id not in self.identity_cache) or (self.frame_count % RECHECK_INTERVAL == 0)
+                        # --- LOGIKA PENCOCOKAN (COSINE SIMILARITY) ---
+                        max_score = 0
+                        name = "UNKNOWN"
                         
-                        if should_recognize:
-                            # [PERBAIKAN] Jangan crop 40% atas saja.
-                            # Ambil kotak badan dengan padding, biarkan Face Recog mencari wajahnya.
-                            h, w = frame.shape[:2]
-                            pad_x = int((x2 - x1) * 0.1) # Padding 10%
-                            pad_y = int((y2 - y1) * 0.1)
-                            
-                            crop_x1 = max(0, x1 - pad_x)
-                            crop_y1 = max(0, y1 - pad_y)
-                            crop_x2 = min(w, x2 + pad_x)
-                            # Ambil sampai 60% badan ke bawah (cukup sampai dada)
-                            crop_y2 = min(h, y1 + int((y2 - y1) * 0.6)) 
-                            
-                            face_crop = frame[crop_y1:crop_y2, crop_x1:crop_x2]
-                            
-                            # Validasi crop tidak kosong
-                            if face_crop.size > 0:
-                                rgb_crop = sanitize_image_for_dlib(face_crop)
+                        if len(known_embeddings) > 0:
+                            for idx, db_emb in enumerate(known_embeddings):
+                                # Hitung kemiripan (Rumus Matematika Vektor)
+                                # Hasilnya antara -1 sampai 1. (1 = Mirip Sempurna)
+                                score = np.dot(live_emb, db_emb) / (np.linalg.norm(live_emb) * np.linalg.norm(db_emb))
                                 
-                                # Detect Wajah dalam Crop
-                                # model="hog" lebih cepat dari "cnn"
-                                face_locs = face_recognition.face_locations(rgb_crop, model="hog")
-                                
-                                name = "UNKNOWN"
-                                if face_locs:
-                                    # Ambil encoding wajah pertama (terbesar)
-                                    face_enc = face_recognition.face_encodings(rgb_crop, face_locs)[0]
-                                    
-                                    if len(known_face_encodings) > 0:
-                                        matches = face_recognition.compare_faces(known_face_encodings, face_enc, tolerance=FACE_REC_TOLERANCE)
-                                        dists = face_recognition.face_distance(known_face_encodings, face_enc)
-                                        
-                                        if True in matches:
-                                            best_match_idx = np.argmin(dists)
-                                            if matches[best_match_idx]:
-                                                name = known_face_names[best_match_idx]
-                                
-                                # Simpan hasil ke Cache
-                                self.identity_cache[track_id] = name
-                            else:
-                                # Jika crop gagal, jangan update cache (biar dicoba lagi frame depan)
-                                pass
+                                if score > max_score:
+                                    max_score = score
+                                    if score >= SIMILARITY_THRESHOLD:
+                                        name = known_names[idx]
+                        
+                        # Simpan nama untuk notifikasi
+                        if name != "UNKNOWN":
+                            current_names_in_frame.append(name)
 
                         # --- VISUALISASI ---
-                        display_name = self.identity_cache.get(track_id, "Scanning...")
+                        # Hijau jika kenal, Merah jika Unknown
+                        color = (0, 255, 0) if name != "UNKNOWN" else (0, 0, 255)
                         
-                        # Warna: Hijau (Kenal), Merah (Unknown/Scanning)
-                        color = (0, 255, 0) if display_name not in ["UNKNOWN", "Scanning..."] else (0, 0, 255)
+                        # Tampilkan Score kemiripan untuk debug (misal: ARYA 0.65)
+                        label = f"{name} ({max_score:.2f})"
                         
-                        # Gambar Kotak
                         cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), color, 2)
                         
-                        # Label di atas kotak
-                        label = f"{display_name} [{track_id}]"
-                        t_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
-                        cv2.rectangle(annotated_frame, (x1, y1 - 25), (x1 + t_size[0] + 10, y1), color, -1)
-                        cv2.putText(annotated_frame, label, (x1 + 5, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                        # Background Label
+                        (w, h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+                        cv2.rectangle(annotated_frame, (x1, y1 - 25), (x1 + w, y1), color, -1)
+                        cv2.putText(annotated_frame, label, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
-                    # Kirim Notifikasi
-                    self.handle_alert(track_ids, annotated_frame)
+                    # Trigger Notifikasi
+                    self.handle_alert(current_names_in_frame, annotated_frame)
                 
-                # Bersihkan cache ID lama
-                active_ids = set(track_ids)
-                expired = [k for k in self.identity_cache if k not in active_ids]
-                for k in expired: del self.identity_cache[k]
-
                 # Update Output Frame
                 with self.local_lock:
                     self.output_frame = annotated_frame.copy()
-                
-                self.frame_count += 1
             
             except Exception as e:
-                # print(f"❌ Logic Error: {e}") # Uncomment untuk debug
+                print(f"❌ Error Logic: {e}")
                 with self.local_lock:
                     self.output_frame = frame
 
         if self.cap: self.cap.release()
         print(f"🛑 Cam {self.cam_id} Stopped")
 
-    def handle_alert(self, current_ids, frame):
+    def handle_alert(self, current_names, frame):
+        """
+        Logika Notifikasi Berbasis Nama (Bukan ID Tracking).
+        Jika "ARYA" muncul, kirim notif. Lalu cooldown 30 detik untuk "ARYA".
+        Jika "BOS" muncul, kirim notif "BOS" (meskipun Arya sedang cooldown).
+        """
         now = time.time()
         cooldown = int(CURRENT_CONFIG.get('cooldown', 30))
         
-        # Reset memori jika sepi > 30 detik
+        # Reset buffer nama jika sudah lama sepi
         if (now - self.last_detection_time > cooldown):
-            self.detected_ids.clear()
-        
+            self.detected_names_buffer.clear()
         self.last_detection_time = now
-        if len(current_ids) == 0: return
-        
-        # Cek Global Cooldown Notifikasi
-        if (now - g.last_global_send_time > cooldown):
-            new_person = False
-            for pid in current_ids:
-                if pid not in self.detected_ids:
-                    self.detected_ids.add(pid)
-                    new_person = True
-            
-            if new_person:
+
+        if not current_names: return
+
+        # Cek apakah ada nama BARU yang belum dikirim notifnya
+        new_names_found = []
+        for name in current_names:
+            if name not in self.detected_names_buffer:
+                new_names_found.append(name)
+                self.detected_names_buffer.add(name) # Masukkan ke daftar "sudah dikirim"
+
+        # Jika ada orang baru ATAU Global Cooldown sudah lewat (untuk reminder)
+        # Kita gunakan logika sederhana: Kirim jika ada nama baru terdeteksi
+        if new_names_found:
+            # Cek Global Cooldown (agar tidak spamming WA per detik)
+            if (now - g.last_global_send_time > 5): # Minimal jarak antar WA 5 detik
                 g.last_global_send_time = now
-                print(f"🔔 Notif Sent from Cam {self.cam_id}")
                 
-                # Compress gambar (Quality 60%) biar kirimnya cepat
+                print(f"🔔 Notif Triggered: {new_names_found}")
+                
+                # Compress gambar
                 _, buffer = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 60])
-                
+                count = len(current_names)
+
                 if CURRENT_CONFIG.get('waha_enabled'):
                     b64 = base64.b64encode(buffer).decode('utf-8')
-                    threading.Thread(target=send_whatsapp, args=(self.cam_id, len(current_ids), b64)).start()
+                    threading.Thread(target=send_whatsapp, args=(self.cam_id, count, b64)).start()
                 
                 if CURRENT_CONFIG.get('telegram_enabled'):
                     img_bytes = buffer.tobytes()
-                    threading.Thread(target=send_telegram, args=(self.cam_id, len(current_ids), img_bytes)).start()
+                    threading.Thread(target=send_telegram, args=(self.cam_id, count, img_bytes)).start()
 
     def get_frame(self):
         with self.local_lock:
             if self.output_frame is None: return None
-            
-            # RESIZE DISPLAY (Biar Web Interface Ringan)
+            # Resize agar Web Interface ringan
             h, w = self.output_frame.shape[:2]
             if w > 640:
                 scale = 640 / float(w)
                 out = cv2.resize(self.output_frame, None, fx=scale, fy=scale)
             else:
                 out = self.output_frame
-            
             ret, encoded = cv2.imencode(".jpg", out, [int(cv2.IMWRITE_JPEG_QUALITY), 50])
             return bytearray(encoded) if ret else None
     
