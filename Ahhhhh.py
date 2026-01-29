@@ -1,85 +1,93 @@
 import os
-# Paksa OpenCV menggunakan CPU untuk Video I/O agar tidak rebutan dengan DirectML
-os.environ["OPENCV_VIDEOIO_PRIORITY_MSMF"] = "0"
-
 import cv2
 import time
 import threading
 import base64
 import numpy as np
-import app.core.globals as g
+import face_recognition
+import torch 
+from ultralytics import YOLO
 
-# Import InsightFace
-from insightface.app import FaceAnalysis
+# [PENTING] Paksa FFmpeg menggunakan TCP
+os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
 
 # Import modul internal
 from .globals import CURRENT_CONFIG, ACTIVE_STREAMS
 from .plc import update_plc_status
 from .notifier import send_whatsapp, send_telegram
+import app.core.globals as g
 
 # ==========================================
-# 1. KONFIGURASI AI (DIRECTML)
+# KONFIGURASI
 # ==========================================
-print("🚀 Menginisialisasi InsightFace (DirectML Mode)...")
+DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+print(f"🚀 [SYSTEM] Inference Device: {DEVICE.upper()}")
 
-# Gunakan DmlExecutionProvider (DirectX 12)
-app_face = FaceAnalysis(name='buffalo_s', providers=['DmlExecutionProvider', 'CPUExecutionProvider'])
-app_face.prepare(ctx_id=0, det_size=(640, 640))
+model = YOLO("yolov8s.pt").to(DEVICE) # Load ke GPU
 
-FOLDER_DATABASE = "database_wajah" 
-known_embeddings = [] 
-known_names = []
-SIMILARITY_THRESHOLD = 0.50 
+# --- KONFIGURASI TIMING (SESUAI REQUEST) ---
+INTERVAL_UNKNOWN = 5   # Cek cepat jika belum kenal (tiap 5 frame)
+INTERVAL_KNOWN = 30    # Re-check santai jika sudah kenal (tiap 30 frame)
 
-# PENTING: Interval Deteksi
-# AI hanya akan jalan setiap 5 frame sekali. 
-# Ini MENCEGAH program crash saat web dibuka.
-FRAME_SKIP_INTERVAL = 5 
+FOLDER_DATABASE = "database_wajah"
+FACE_TOLERANCE = 0.50
+YOLO_CONF_TRACK = 0.40 
+
+known_face_encodings = []
+known_face_names = []
 
 # ==========================================
-# 2. LOAD DATABASE
+# HELPER FUNCTIONS
 # ==========================================
+def sanitize_image_for_dlib(img_cv):
+    if img_cv is None: return None
+    return np.ascontiguousarray(img_cv[:, :, ::-1])
+
 def load_face_database():
-    global known_embeddings, known_names
-    base_dir = os.path.dirname(os.path.abspath(__file__)) 
-    root_dir = os.path.dirname(base_dir) 
+    global known_face_encodings, known_face_names
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    root_dir = os.path.dirname(base_dir)
     db_path = os.path.join(root_dir, FOLDER_DATABASE)
 
     if not os.path.exists(db_path):
         os.makedirs(db_path)
         return
 
-    print(f"📂 Memuat Database dari '{db_path}'...")
-    known_embeddings = []
-    known_names = []
+    print(f"📂 [LOAD] Memuat Database Wajah dari '{db_path}'...")
+    known_face_encodings = []
+    known_face_names = []
     
+    count = 0
     for filename in os.listdir(db_path):
         if filename.lower().endswith(('.jpg', '.jpeg', '.png')):
             path = os.path.join(db_path, filename)
             try:
                 img = cv2.imread(path)
-                if img is None: continue
-                faces = app_face.get(img)
-                if len(faces) > 0:
-                    known_embeddings.append(faces[0].embedding)
-                    name = os.path.splitext(filename)[0].replace("_", " ").upper()
-                    name = ''.join([i for i in name if not i.isdigit()]).strip()
-                    known_names.append(name)
+                rgb = sanitize_image_for_dlib(img)
+                if rgb is not None:
+                    encs = face_recognition.face_encodings(rgb)
+                    if encs:
+                        name = os.path.splitext(filename)[0].replace("_", " ").upper()
+                        name = ''.join([i for i in name if not i.isdigit()]).strip()
+                        known_face_encodings.append(encs[0])
+                        known_face_names.append(name)
+                        count += 1
             except Exception:
-                pass
-    print(f"✨ Total Database: {len(known_names)} wajah.")
+                pass     
+    print(f"✨ [READY] Total Database: {count} wajah.")
 
 load_face_database()
 
 # ==========================================
-# 3. BUFFERLESS CAPTURE (Anti Lag)
+# CLASS 1: BUFFERLESS CAPTURE
 # ==========================================
 class BufferlessVideoCapture:
     def __init__(self, name):
         self.cap = cv2.VideoCapture(name)
-        # Set resolusi rendah agar ringan
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        if isinstance(name, int):
+            self.cap.set(3, 640)
+            self.cap.set(4, 480)
         self.lock = threading.Lock()
         self.t = threading.Thread(target=self._reader)
         self.t.daemon = True
@@ -101,7 +109,9 @@ class BufferlessVideoCapture:
 
     def read(self):
         with self.lock:
-            return self.status, (self.latest_frame.copy() if self.latest_frame is not None else None)
+            if self.latest_frame is not None:
+                return self.status, self.latest_frame.copy()
+            return self.status, None
 
     def release(self):
         self.running = False
@@ -109,7 +119,7 @@ class BufferlessVideoCapture:
         self.cap.release()
 
 # ==========================================
-# 4. STREAM PROCESSOR (SAFE MODE)
+# CLASS 2: HYBRID STREAM (RE-CHECK LOGIC)
 # ==========================================
 class CamStream(threading.Thread):
     def __init__(self, cam_id, source):
@@ -118,137 +128,163 @@ class CamStream(threading.Thread):
         self.source = int(source) if str(source).isdigit() else source
         self.running = True
         self.output_frame = None
+        self.local_lock = threading.Lock()
         
-        # Variabel untuk "Ingatan" AI (Caching)
-        self.last_faces_cache = [] 
-        self.frame_count = 0
-        
-        self.detected_names_buffer = set() 
+        self.detected_ids = set()
         self.last_detection_time = 0
-        self.local_lock = threading.Lock() # Kunci Pengaman Thread
         self.cap = None 
+        
+        # Format: { track_id: "NAMA" }
+        self.track_history = {} 
+        # Format: { track_id: int_countdown }
+        self.track_timers = {} 
 
     def run(self):
-        print(f"🎥 Start Cam {self.cam_id}...")
+        print(f"🎥 [START] Cam {self.cam_id} using {DEVICE}...")
         self.cap = BufferlessVideoCapture(self.source)
-        time.sleep(1) 
+        time.sleep(1)
 
         while self.running:
             success, frame = self.cap.read()
-            
             if not success or frame is None:
-                time.sleep(1)
+                time.sleep(0.1)
                 continue
             
-            # Resize frame jika terlalu besar (Wajib untuk GTX 745)
-            # Semakin kecil gambar, semakin kecil kemungkinan crash
-            h, w = frame.shape[:2]
-            if w > 640:
-                scale = 640 / w
-                frame = cv2.resize(frame, None, fx=scale, fy=scale)
+            try:
+                # 1. YOLO TRACKING (GPU) - ByteTrack Active
+                results = model.track(frame, persist=True, classes=[0], 
+                                    conf=YOLO_CONF_TRACK, verbose=False, device=DEVICE)
+                
+                boxes = []
+                track_ids = []
+                
+                if results[0].boxes.id is not None:
+                    boxes = results[0].boxes.xyxy.cpu().numpy().astype(int)
+                    track_ids = results[0].boxes.id.cpu().numpy().astype(int)
+                
+                has_person = len(boxes) > 0
+                update_plc_status(self.cam_id, has_person)
 
-            # --- LOGIKA "AI JALAN SANTAI" ---
-            self.frame_count += 1
-            
-            # Cek apakah saatnya menjalankan AI (misal: tiap 5 frame)
-            if self.frame_count % FRAME_SKIP_INTERVAL == 0:
-                try:
-                    # Jalankan InsightFace
-                    faces = app_face.get(frame)
-                    
-                    # Update Cache Hasil Deteksi
-                    self.last_faces_cache = []
-                    current_names_in_frame = []
-                    
-                    for face in faces:
-                        box = face.bbox.astype(int)
-                        live_emb = face.embedding
+                annotated_frame = frame.copy()
+                current_frame_ids = []
+
+                if has_person:
+                    for box, track_id in zip(boxes, track_ids):
+                        x1, y1, x2, y2 = box
+                        current_frame_ids.append(track_id)
                         
-                        # Pencocokan Wajah
-                        name = "UNKNOWN"
-                        max_score = 0
-                        if len(known_embeddings) > 0:
-                            scores = np.dot(known_embeddings, live_emb) / (
-                                np.linalg.norm(known_embeddings, axis=1) * np.linalg.norm(live_emb)
-                            )
-                            max_idx = np.argmax(scores)
-                            max_score = scores[max_idx]
+                        # Inisialisasi Timer untuk ID baru
+                        if track_id not in self.track_timers:
+                            self.track_timers[track_id] = 0 # Langsung scan saat pertama muncul
+                        
+                        # --- LOGIKA RE-CHECK ---
+                        # Cek apakah timer sudah habis (<= 0)
+                        if self.track_timers[track_id] <= 0:
                             
-                            if max_score >= SIMILARITY_THRESHOLD:
-                                name = known_names[max_idx]
+                            # Lakukan Scan Wajah (Hanya Crop Atas)
+                            face_y2 = y1 + int((y2 - y1) * 0.5) 
+                            crop_img = frame[y1:face_y2, x1:x2]
+                            
+                            found_name = "Unknown"
+                            
+                            if crop_img.size > 0:
+                                rgb_crop = sanitize_image_for_dlib(crop_img)
+                                face_locs = face_recognition.face_locations(rgb_crop, model="hog")
+                                
+                                if face_locs:
+                                    face_enc = face_recognition.face_encodings(rgb_crop, face_locs)[0]
+                                    if len(known_face_encodings) > 0:
+                                        matches = face_recognition.compare_faces(known_face_encodings, face_enc, tolerance=FACE_TOLERANCE)
+                                        dists = face_recognition.face_distance(known_face_encodings, face_enc)
+                                        
+                                        if True in matches:
+                                            best_match_idx = np.argmin(dists)
+                                            if matches[best_match_idx]:
+                                                found_name = known_face_names[best_match_idx]
+                            
+                            # Update History Nama
+                            self.track_history[track_id] = found_name
+                            
+                            # SET TIMER BERDASARKAN HASIL
+                            if found_name != "Unknown":
+                                # Jika sudah kenal, cek lagi 30 frame kemudian (hemat resource)
+                                self.track_timers[track_id] = INTERVAL_KNOWN
+                            else:
+                                # Jika belum kenal, cek lagi 5 frame kemudian (agresif)
+                                self.track_timers[track_id] = INTERVAL_UNKNOWN
                         
-                        # Simpan ke cache untuk digambar di frame-frame berikutnya
-                        self.last_faces_cache.append({
-                            "box": box,
-                            "name": name,
-                            "score": max_score
-                        })
-                        
-                        if name != "UNKNOWN":
-                            current_names_in_frame.append(name)
-                    
-                    # Logika PLC & Notifikasi (Hanya saat AI jalan)
-                    update_plc_status(self.cam_id, len(faces) > 0)
-                    self.handle_alert(current_names_in_frame, frame)
-                    
-                except Exception as e:
-                    print(f"⚠️ AI Error (DirectML Glitch): {e}")
-                    # Jika error, biarkan lewat (jangan stop program)
-            
-            # --- GAMBAR HASIL (Dari Cache) ---
-            # Kita menggambar kotak berdasarkan ingatan terakhir AI
-            # Jadi meskipun AI tidak jalan di frame ini, kotak tetap muncul (smooth)
-            annotated_frame = frame.copy()
-            for item in self.last_faces_cache:
-                x1, y1, x2, y2 = item["box"]
-                name = item["name"]
-                score = item["score"]
-                
-                color = (0, 255, 0) if name != "UNKNOWN" else (0, 0, 255)
-                label = f"{name} ({score:.2f})"
-                
-                cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), color, 2)
-                cv2.rectangle(annotated_frame, (x1, y1 - 20), (x1 + 150, y1), color, -1)
-                cv2.putText(annotated_frame, label, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                        else:
+                            # Kurangi Timer
+                            self.track_timers[track_id] -= 1
 
-            # Update Frame Output untuk Web
-            with self.local_lock:
-                self.output_frame = annotated_frame
+                        # --- VISUALISASI ---
+                        display_name = self.track_history.get(track_id, "Unknown")
+                        color = (0, 255, 0) if display_name != "Unknown" else (0, 0, 255)
+                        
+                        cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), color, 2)
+                        label = f"{display_name} [{track_id}]"
+                        t_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
+                        cv2.rectangle(annotated_frame, (x1, y1 - 25), (x1 + t_size[0] + 10, y1), color, -1)
+                        cv2.putText(annotated_frame, label, (x1 + 5, y1 - 5), 
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+                    self.handle_alert(track_ids, annotated_frame)
+                
+                # Garbage Collection
+                if len(self.track_history) > 20:
+                    active_set = set(current_frame_ids)
+                    self.track_history = {k:v for k,v in self.track_history.items() if k in active_set}
+                    self.track_timers = {k:v for k,v in self.track_timers.items() if k in active_set}
+
+                with self.local_lock:
+                    self.output_frame = annotated_frame.copy()
+            
+            except Exception as e:
+                print(f"❌ [ERROR] Cam {self.cam_id}: {e}")
+                with self.local_lock: self.output_frame = frame
 
         if self.cap: self.cap.release()
 
-    def handle_alert(self, current_names, frame):
+    def handle_alert(self, current_ids, frame):
         now = time.time()
         cooldown = int(CURRENT_CONFIG.get('cooldown', 30))
+        
         if (now - self.last_detection_time > cooldown):
-            self.detected_names_buffer.clear()
+            self.detected_ids.clear()
+        
         self.last_detection_time = now
-
-        new_names = [n for n in current_names if n not in self.detected_names_buffer]
-        if new_names:
-            for n in new_names: self.detected_names_buffer.add(n)
+        if len(current_ids) == 0: return
+        
+        if (now - g.last_global_send_time > cooldown):
+            new_person = False
+            for pid in current_ids:
+                if pid not in self.detected_ids:
+                    self.detected_ids.add(pid)
+                    new_person = True
             
-            if (now - g.last_global_send_time > 5):
+            if new_person:
                 g.last_global_send_time = now
-                print(f"🔔 Notif: {new_names}")
-                _, buffer = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 50])
-                b64 = base64.b64encode(buffer).decode('utf-8')
+                _, buffer = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 60])
                 
                 if CURRENT_CONFIG.get('waha_enabled'):
-                    threading.Thread(target=send_whatsapp, args=(self.cam_id, len(current_names), b64)).start()
+                    b64 = base64.b64encode(buffer).decode('utf-8')
+                    threading.Thread(target=send_whatsapp, args=(self.cam_id, len(current_ids), b64)).start()
+                
+                if CURRENT_CONFIG.get('telegram_enabled'):
+                    img_bytes = buffer.tobytes()
+                    threading.Thread(target=send_telegram, args=(self.cam_id, len(current_ids), img_bytes)).start()
 
     def get_frame(self):
-        # Fungsi ini dipanggil oleh Web Browser
         with self.local_lock:
             if self.output_frame is None: return None
-            
-            try:
-                # Kompresi gambar menjadi JPEG untuk dikirim ke web
-                ret, encoded = cv2.imencode(".jpg", self.output_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 40])
-                return bytearray(encoded) if ret else None
-            except Exception as e:
-                print(f"Web Stream Error: {e}")
-                return None
+            h, w = self.output_frame.shape[:2]
+            if w > 800:
+                scale = 800 / float(w)
+                out = cv2.resize(self.output_frame, None, fx=scale, fy=scale)
+            else:
+                out = self.output_frame
+            ret, encoded = cv2.imencode(".jpg", out, [int(cv2.IMWRITE_JPEG_QUALITY), 60])
+            return bytearray(encoded) if ret else None
     
     def stop(self):
         self.running = False
