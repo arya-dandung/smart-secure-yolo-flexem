@@ -84,3 +84,23 @@ smart-secure-yolo-flexem/
 ├── config.yaml         # File Konfigurasi
 ├── main.py             # Entry Point
 └── requirements.txt    # Daftar Library
+
+C:\AI SATPAM\smart-secure-yolo-flexem-main\  <-- Root Project
+│
+├── known_faces/              <-- [BARU] Folder tempat taruh foto wajah (arya.jpg, bos.jpg)
+│   ├── arya.jpg
+│   └── ...
+│
+├── app/
+│   ├── core/
+│   │   ├── __init__.py
+│   │   ├── camera.py         <-- [EDIT] Kode utama CCTV ada di sini
+│   │   ├── face_engine.py    <-- [BARU] Logika InsightFace (CPU)
+│   │   ├── globals.py
+│   │   ├── notifier.py
+│   │   └── plc.py
+│   │
+│   └── ... (folder lain)
+│
+├── main.py                   <-- Entry point aplikasi
+└── requirements.txt
